@@ -426,6 +426,34 @@ def severity_from_z(z_value: Optional[float]) -> str:
     return "Normal"
 
 
+def theil_sen_slope(x: np.ndarray, y: np.ndarray) -> Optional[float]:
+    """Compute a robust slope estimate using the Theil-Sen estimator."""
+
+    if x.size == 0 or y.size == 0:
+        return None
+
+    valid = ~(np.isnan(x) | np.isnan(y))
+    x = x[valid]
+    y = y[valid]
+
+    n = len(x)
+    if n < 2:
+        return None
+
+    slopes: list[float] = []
+    for i in range(n - 1):
+        for j in range(i + 1, n):
+            dx = x[j] - x[i]
+            if np.isclose(dx, 0.0):
+                continue
+            slopes.append(float((y[j] - y[i]) / dx))
+
+    if not slopes:
+        return None
+
+    return float(np.median(slopes))
+
+
 def build_metric_chart(
     *,
     units: str,
@@ -733,6 +761,80 @@ def build_distribution_snapshot(
     return finalize_chart_layout(chart, height=220)
 
 
+def describe_metric_trend(
+    *,
+    history_points: pd.DataFrame,
+    new_points: pd.DataFrame,
+    period_order: list[str],
+    baseline_mad: Optional[float],
+    units: str,
+) -> Optional[str]:
+    """Generate a textual summary of the overall metric trend."""
+
+    combined = pd.concat([history_points, new_points], ignore_index=True)
+    combined = combined.dropna(subset=["Value"]).copy()
+    if combined.empty:
+        return None
+
+    if period_order:
+        order_map = {period: idx for idx, period in enumerate(period_order)}
+        combined["Order"] = combined["Period"].map(order_map)
+    else:
+        combined = combined.reset_index(drop=True)
+        combined["Order"] = combined.index.astype(float)
+
+    combined = combined.dropna(subset=["Order"])
+    if combined.empty:
+        return None
+
+    combined = (
+        combined.groupby("Order", as_index=False)["Value"].mean().sort_values("Order")
+    )
+
+    order = combined["Order"].to_numpy(dtype=float)
+    values = combined["Value"].to_numpy(dtype=float)
+
+    slope = theil_sen_slope(order, values)
+    if slope is None or np.isclose(slope, 0.0, atol=1e-9):
+        return "Trend: holding steady (slope ≈ 0)."
+
+    span = order.max() - order.min()
+    projected_shift = slope * span if span > 0 else slope
+
+    normalized = None
+    if (
+        baseline_mad is not None
+        and not pd.isna(baseline_mad)
+        and not np.isclose(baseline_mad, 0.0)
+    ):
+        normalized = abs(projected_shift) / baseline_mad
+
+    direction = "increasing" if slope > 0 else "decreasing"
+    magnitude_descriptor = "gradually"
+
+    if normalized is not None:
+        if normalized >= 1.5:
+            magnitude_descriptor = "strongly"
+        elif normalized >= 0.5:
+            magnitude_descriptor = "gradually"
+        else:
+            return (
+                "Trend: holding steady (movement over the window is small relative to"
+                " typical variability)."
+            )
+
+    units_label = f" {units}" if units else ""
+    slope_text = f"{slope:+.4g}{units_label}/period"
+    span_periods = int(span) if span and span >= 1 else len(values) - 1
+    if span_periods < 1:
+        span_periods = len(values)
+
+    return (
+        f"Trend: {magnitude_descriptor} {direction} (≈ {slope_text} across the last"
+        f" {span_periods if span_periods > 0 else len(values)} periods)."
+    )
+
+
 def build_anomaly_gauge(robust_score: Optional[float]) -> Optional[go.Figure]:
     """Render a semicircular gauge for the robust z-score magnitude."""
 
@@ -980,6 +1082,17 @@ def main() -> None:
                 if distribution_chart is not None:
                     st.markdown("**Historical Distribution**")
                     st.altair_chart(distribution_chart, use_container_width=True)
+
+                trend_text = describe_metric_trend(
+                    history_points=history_points,
+                    new_points=new_points,
+                    period_order=period_order,
+                    baseline_mad=metric_row.get("Baseline MAD"),
+                    units=metric_row.get("Units", ""),
+                )
+                if trend_text:
+                    st.markdown("**Trend Insight**")
+                    st.caption(trend_text)
 
                 delta = metric_row.get("Percent Change")
                 abs_delta = metric_row.get("Absolute Change")
