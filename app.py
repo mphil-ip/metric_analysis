@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import io
-from typing import Optional
+from typing import Optional, Any
 
 import altair as alt
 import plotly.graph_objects as go
@@ -104,11 +104,23 @@ def robust_z_score(value: float, median: float, mad: float) -> Optional[float]:
     return float((value - median) / scaled_mad)
 
 
+def sensitivity_thresholds(sensitivity: float) -> tuple[float, float]:
+    factor = sensitivity if sensitivity and not np.isnan(sensitivity) else 1.0
+    factor = max(factor, 0.1)
+    mild_threshold = 2.5 / factor
+    severe_threshold = 4.0 / factor
+    # Ensure ordering even with extreme sensitivity values
+    if mild_threshold > severe_threshold:
+        mild_threshold, severe_threshold = severe_threshold, mild_threshold
+    return mild_threshold, severe_threshold
+
+
 def categorize_severity(
     robust_score: Optional[float],
     deviation: float,
     baseline_mad: float,
     history_count: int,
+    sensitivity: float,
 ) -> str:
     """Map robust z-score and deviation to severity buckets."""
 
@@ -119,9 +131,11 @@ def categorize_severity(
         return "Stable" if deviation == 0 else "Severe"
 
     distance = abs(robust_score)
-    if distance >= 4:
+    mild_threshold, severe_threshold = sensitivity_thresholds(sensitivity)
+
+    if distance >= severe_threshold:
         return "Severe"
-    if distance >= 2.5:
+    if distance >= mild_threshold:
         return "Mild"
     return "Normal"
 
@@ -138,6 +152,8 @@ def describe_implication(
     units: str,
     history_count: int,
     period: str,
+    mild_threshold: float,
+    severe_threshold: float,
 ) -> str:
     """Create a plain-language explanation for the anomaly result."""
 
@@ -197,9 +213,9 @@ def describe_implication(
 
     if robust_score is not None and not np.isnan(robust_score):
         abs_z = abs(robust_score)
-        if abs_z >= 4:
+        if abs_z >= severe_threshold:
             z_context = "well past our alert level."
-        elif abs_z >= 2.5:
+        elif abs_z >= mild_threshold:
             z_context = "noticeably outside the comfort zone."
         else:
             z_context = "comfortably within the expected band."
@@ -227,6 +243,7 @@ def describe_implication(
 def evaluate_new_points(
     history: pd.DataFrame,
     new_points: pd.DataFrame,
+    sensitivity: float,
 ) -> pd.DataFrame:
     """Compare each new metric observation against historical context."""
 
@@ -234,6 +251,7 @@ def evaluate_new_points(
     merged = new_points.merge(baselines, on="Metric", how="left")
 
     results = []
+    mild_threshold, severe_threshold = sensitivity_thresholds(sensitivity)
     for _, row in merged.iterrows():
         value = row["Value"]
         median = row.get("baseline_median")
@@ -252,7 +270,9 @@ def evaluate_new_points(
             relative_change = (
                 (deviation / median) * 100 if median not in (0, np.nan) else np.nan
             )
-            severity = categorize_severity(robust_score, deviation, mad, history_count)
+            severity = categorize_severity(
+                robust_score, deviation, mad, history_count, sensitivity
+            )
             interpretation = describe_implication(
                 severity,
                 deviation,
@@ -264,6 +284,8 @@ def evaluate_new_points(
                 units=row.get("Units", ""),
                 history_count=history_count,
                 period=row.get("Period", ""),
+                mild_threshold=mild_threshold,
+                severe_threshold=severe_threshold,
             )
 
         results.append(
@@ -415,13 +437,18 @@ def collect_metric_frames(
     return history_points, new_points, period_order
 
 
-def severity_from_z(z_value: Optional[float]) -> str:
+def severity_from_z(
+    z_value: Optional[float],
+    *,
+    mild_threshold: float = 2.5,
+    severe_threshold: float = 4.0,
+) -> str:
     if z_value is None or pd.isna(z_value):
         return "Stable"
     magnitude = abs(float(z_value))
-    if magnitude >= 4:
+    if magnitude >= severe_threshold:
         return "Severe"
-    if magnitude >= 2.5:
+    if magnitude >= mild_threshold:
         return "Mild"
     return "Normal"
 
@@ -462,6 +489,7 @@ def build_metric_chart(
     period_order: list[str],
     baseline_median: Optional[float],
     baseline_mad: Optional[float],
+    sensitivity: float,
 ) -> Optional[alt.Chart]:
     """Create a time-series chart with baseline and anomaly annotations."""
 
@@ -486,6 +514,8 @@ def build_metric_chart(
         scaled_mad = baseline_mad * 1.4826
         if np.isclose(scaled_mad, 0.0):
             scaled_mad = None
+
+    mild_threshold, severe_threshold = sensitivity_thresholds(sensitivity)
 
     if scaled_mad is not None:
         history_plot["RobustZ"] = (
@@ -549,8 +579,8 @@ def build_metric_chart(
         layers.append(baseline_rule)
 
     if scaled_mad is not None:
-        mild_delta = 2.5 * scaled_mad
-        severe_delta = 4.0 * scaled_mad
+        mild_delta = mild_threshold * scaled_mad
+        severe_delta = severe_threshold * scaled_mad
         thresholds = [
             (baseline_median + mild_delta, severity_color("Mild")),
             (baseline_median - mild_delta, severity_color("Mild")),
@@ -581,6 +611,7 @@ def build_zscore_timeline(
     period_order: list[str],
     baseline_median: Optional[float],
     baseline_mad: Optional[float],
+    sensitivity: float,
 ) -> Optional[alt.Chart]:
     """Display robust z-scores over time with alert thresholds."""
 
@@ -600,6 +631,8 @@ def build_zscore_timeline(
     history_plot = history_points.copy()
     new_plot = new_points.copy()
 
+    mild_threshold, severe_threshold = sensitivity_thresholds(sensitivity)
+
     history_plot["RobustZ"] = (
         (history_plot["Value"] - baseline_median) / scaled_mad
         if not history_plot.empty
@@ -611,8 +644,16 @@ def build_zscore_timeline(
         else pd.Series(dtype=float)
     )
 
-    history_plot["Severity"] = history_plot["RobustZ"].apply(severity_from_z)
-    new_plot["Severity"] = new_plot["RobustZ"].apply(severity_from_z)
+    history_plot["Severity"] = history_plot["RobustZ"].apply(
+        lambda z: severity_from_z(
+            z, mild_threshold=mild_threshold, severe_threshold=severe_threshold
+        )
+    )
+    new_plot["Severity"] = new_plot["RobustZ"].apply(
+        lambda z: severity_from_z(
+            z, mild_threshold=mild_threshold, severe_threshold=severe_threshold
+        )
+    )
 
     y_field = alt.Y("RobustZ:Q", title="Robust z-score")
     x_field = alt.X("Period:N", sort=(period_order if period_order else None), title="Period")
@@ -677,10 +718,10 @@ def build_zscore_timeline(
     layers.append(zero_line)
 
     for threshold, label_color in [
-        (2.5, severity_color("Mild")),
-        (-2.5, severity_color("Mild")),
-        (4.0, severity_color("Severe")),
-        (-4.0, severity_color("Severe")),
+        (mild_threshold, severity_color("Mild")),
+        (-mild_threshold, severity_color("Mild")),
+        (severe_threshold, severity_color("Severe")),
+        (-severe_threshold, severity_color("Severe")),
     ]:
         rule = (
             alt.Chart(pd.DataFrame({"RobustZ": [threshold]}))
@@ -699,6 +740,7 @@ def build_distribution_snapshot(
     baseline_median: Optional[float],
     baseline_mad: Optional[float],
     units: str,
+    sensitivity: float,
 ) -> Optional[alt.Chart]:
     """Render a distribution view of historical values with thresholds."""
 
@@ -737,10 +779,11 @@ def build_distribution_snapshot(
         and baseline_median is not None
         and not pd.isna(baseline_median)
     ):
+        mild_threshold, severe_threshold = sensitivity_thresholds(sensitivity)
         scaled_mad = baseline_mad * 1.4826
         if not np.isclose(scaled_mad, 0.0):
-            mild_delta = 2.5 * scaled_mad
-            severe_delta = 4.0 * scaled_mad
+            mild_delta = mild_threshold * scaled_mad
+            severe_delta = severe_threshold * scaled_mad
             thresholds = [
                 (baseline_median + mild_delta, severity_color("Mild")),
                 (baseline_median - mild_delta, severity_color("Mild")),
@@ -768,8 +811,8 @@ def describe_metric_trend(
     period_order: list[str],
     baseline_mad: Optional[float],
     units: str,
-) -> Optional[str]:
-    """Generate a textual summary of the overall metric trend."""
+) -> Optional[dict[str, Any]]:
+    """Generate qualitative and quantitative trend context for the metric."""
 
     combined = pd.concat([history_points, new_points], ignore_index=True)
     combined = combined.dropna(subset=["Value"]).copy()
@@ -795,8 +838,32 @@ def describe_metric_trend(
     values = combined["Value"].to_numpy(dtype=float)
 
     slope = theil_sen_slope(order, values)
+    units_label = f" {units}" if units else ""
+    per_period_suffix = f"{units_label}/period" if units_label else " per period"
+
+    direction_symbols = {
+        "increasing": "↗",
+        "decreasing": "↘",
+        "steady": "→",
+    }
+    direction_titles = {
+        "increasing": "Rising",
+        "decreasing": "Falling",
+        "steady": "Steady",
+    }
+
     if slope is None or np.isclose(slope, 0.0, atol=1e-9):
-        return "Trend: holding steady (slope ≈ 0)."
+        summary = "Trend: holding steady (slope ≈ 0)."
+        delta_text = f"≈ 0{per_period_suffix}".strip()
+        return {
+            "summary": summary,
+            "direction": "steady",
+            "descriptor": "steady",
+            "label": f"{direction_symbols['steady']} {direction_titles['steady']}",
+            "slope": float(slope or 0.0),
+            "slope_text": delta_text,
+            "normalized": None,
+        }
 
     span = order.max() - order.min()
     projected_shift = slope * span if span > 0 else slope
@@ -818,34 +885,61 @@ def describe_metric_trend(
         elif normalized >= 0.5:
             magnitude_descriptor = "gradually"
         else:
-            return (
+            summary = (
                 "Trend: holding steady (movement over the window is small relative to"
                 " typical variability)."
             )
+            delta_text = f"≈ 0{per_period_suffix}".strip()
+            return {
+                "summary": summary,
+                "direction": "steady",
+                "descriptor": "steady",
+                "label": f"{direction_symbols['steady']} {direction_titles['steady']}",
+                "slope": float(slope),
+                "slope_text": delta_text,
+                "normalized": normalized,
+            }
 
-    units_label = f" {units}" if units else ""
-    slope_text = f"{slope:+.4g}{units_label}/period"
+    slope_text = f"{slope:+.4g}{per_period_suffix}".strip()
     span_periods = int(span) if span and span >= 1 else len(values) - 1
     if span_periods < 1:
         span_periods = len(values)
 
-    return (
+    summary = (
         f"Trend: {magnitude_descriptor} {direction} (≈ {slope_text} across the last"
         f" {span_periods if span_periods > 0 else len(values)} periods)."
     )
 
+    return {
+        "summary": summary,
+        "direction": direction,
+        "descriptor": magnitude_descriptor,
+        "label": f"{direction_symbols[direction]} {direction_titles[direction]}",
+        "slope": float(slope),
+        "slope_text": slope_text,
+        "normalized": normalized,
+    }
 
-def build_anomaly_gauge(robust_score: Optional[float]) -> Optional[go.Figure]:
+
+def build_anomaly_gauge(
+    robust_score: Optional[float],
+    *,
+    sensitivity: float,
+) -> Optional[go.Figure]:
     """Render a semicircular gauge for the robust z-score magnitude."""
 
     if robust_score is None or pd.isna(robust_score):
         return None
 
     magnitude = float(abs(robust_score))
-    limit = max(4.5, magnitude * 1.2, 4.0)
+    mild_threshold, severe_threshold = sensitivity_thresholds(sensitivity)
 
-    severe_threshold = 4.0
-    mild_threshold = 2.5
+    limit = max(
+        4.5,
+        magnitude * 1.2,
+        severe_threshold * 1.2,
+        mild_threshold * 2.0,
+    )
 
     steps = []
     normal_cap = min(mild_threshold, limit)
@@ -972,6 +1066,17 @@ def main() -> None:
             key="newdata",
         )
 
+        st.markdown("**Detection Sensitivity**")
+        st.slider(
+            "Tune how quickly anomalies trigger",
+            min_value=0.5,
+            max_value=1.5,
+            value=1.0,
+            step=0.1,
+            key="sensitivity_control",
+            help="Higher sensitivity lowers alert thresholds; lower sensitivity raises them.",
+        )
+
         if historical_file is not None:
             try:
                 historical_df = load_dataset(historical_file)
@@ -1022,7 +1127,8 @@ def main() -> None:
             st.warning("New dataset must contain at least one row.")
             return
 
-        results = evaluate_new_points(historical_df, new_df)
+        sensitivity_factor = st.session_state.get("sensitivity_control", 1.0)
+        results = evaluate_new_points(historical_df, new_df, sensitivity_factor)
         ordered_results = results.assign(
             _sev=results["Severity"].map(SEVERITY_ORDER).fillna(6),
             _idx=np.arange(len(results)),
@@ -1049,6 +1155,7 @@ def main() -> None:
                     period_order=period_order,
                     baseline_median=metric_row.get("Baseline Median"),
                     baseline_mad=metric_row.get("Baseline MAD"),
+                    sensitivity=sensitivity_factor,
                 )
                 z_chart = build_zscore_timeline(
                     history_points=history_points,
@@ -1056,24 +1163,36 @@ def main() -> None:
                     period_order=period_order,
                     baseline_median=metric_row.get("Baseline Median"),
                     baseline_mad=metric_row.get("Baseline MAD"),
+                    sensitivity=sensitivity_factor,
                 )
                 distribution_chart = build_distribution_snapshot(
                     history_points=history_points,
                     baseline_median=metric_row.get("Baseline Median"),
                     baseline_mad=metric_row.get("Baseline MAD"),
                     units=metric_row.get("Units", ""),
+                    sensitivity=sensitivity_factor,
                 )
-                gauge_chart = build_anomaly_gauge(metric_row.get("Robust Z"))
+                gauge_chart = build_anomaly_gauge(
+                    metric_row.get("Robust Z"), sensitivity=sensitivity_factor
+                )
 
                 rendered = False
                 if timeseries_chart is not None:
                     st.markdown("**Metric Trajectory**")
-                    st.altair_chart(timeseries_chart, use_container_width=True)
+                    st.altair_chart(
+                        timeseries_chart,
+                        use_container_width=True,
+                        key=f"metric-trajectory-{metric_row.get('Metric', '')}-{metric_row.get('Period', '')}",
+                    )
                     rendered = True
 
                 if z_chart is not None:
                     st.markdown("**Robust Z-Score Trend**")
-                    st.altair_chart(z_chart, use_container_width=True)
+                    st.altair_chart(
+                        z_chart,
+                        use_container_width=True,
+                        key=f"robust-z-trend-{metric_row.get('Metric', '')}-{metric_row.get('Period', '')}",
+                    )
                     rendered = True
 
                 if not rendered:
@@ -1081,23 +1200,35 @@ def main() -> None:
 
                 if distribution_chart is not None:
                     st.markdown("**Historical Distribution**")
-                    st.altair_chart(distribution_chart, use_container_width=True)
+                    st.altair_chart(
+                        distribution_chart,
+                        use_container_width=True,
+                        key=f"distribution-{metric_row.get('Metric', '')}-{metric_row.get('Period', '')}",
+                    )
 
-                trend_text = describe_metric_trend(
+                trend_info = describe_metric_trend(
                     history_points=history_points,
                     new_points=new_points,
                     period_order=period_order,
                     baseline_mad=metric_row.get("Baseline MAD"),
                     units=metric_row.get("Units", ""),
                 )
-                if trend_text:
+                if trend_info:
                     st.markdown("**Trend Insight**")
-                    st.caption(trend_text)
+                    st.caption(trend_info["summary"])
 
                 delta = metric_row.get("Percent Change")
                 abs_delta = metric_row.get("Absolute Change")
 
-                col_current, col_abs, col_pct, col_median, col_mad, col_z = st.columns(6)
+                (
+                    col_current,
+                    col_abs,
+                    col_pct,
+                    col_median,
+                    col_mad,
+                    col_z,
+                    col_trend,
+                ) = st.columns((1, 1, 1, 1, 1, 1, 1.2))
                 col_current.metric(
                     f"Current ({metric_row.get('Units', '')})".rstrip(" ()"),
                     format_value(metric_row.get("Current Value")),
@@ -1124,10 +1255,22 @@ def main() -> None:
                     if pd.isna(metric_row.get("Robust Z"))
                     else f"{metric_row.get('Robust Z'):.2f}",
                 )
+                if trend_info:
+                    col_trend.metric(
+                        "Trend",
+                        trend_info["label"],
+                        trend_info.get("slope_text", ""),
+                    )
+                else:
+                    col_trend.metric("Trend", "–", "")
 
                 if gauge_chart is not None:
                     st.markdown("**Anomaly Gauge**")
-                    st.plotly_chart(gauge_chart, use_container_width=True)
+                    st.plotly_chart(
+                        gauge_chart,
+                        use_container_width=True,
+                        key=f"gauge-{metric_row.get('Metric', '')}-{metric_row.get('Period', '')}",
+                    )
                 else:
                     st.caption("Robust z-score gauge will appear once available.")
 
